@@ -1,13 +1,9 @@
 require('dotenv').config();
 const express = require('express');
-const passport = require('passport');
-const { Strategy: GoogleStrategy } = require('passport-google-oauth20');
 const cors = require('cors');
-const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || process.env.SESSION_SECRET || 'natwest-org-secret-key';
 
 // ── CORS ───────────────────────────────────────────────────────────────────
 const allowedOrigins = [
@@ -26,78 +22,17 @@ app.use(cors({
 
 app.use(express.json());
 
-// ── PASSPORT GOOGLE OAUTH ──────────────────────────────────────────────────
-// No session needed — we use JWT instead
-if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
-  passport.use(new GoogleStrategy({
-    clientID: process.env.GOOGLE_CLIENT_ID,
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-    callbackURL: process.env.CALLBACK_URL || 'http://localhost:3001/auth/google/callback'
-  }, (accessToken, refreshToken, profile, done) => {
-    const email = profile.emails?.[0]?.value || '';
-    if (!email.endsWith('@zamp.ai')) {
-      return done(null, false, { message: 'Only @zamp.ai accounts are allowed.' });
-    }
-    return done(null, { email, name: profile.displayName, picture: profile.photos?.[0]?.value });
-  }));
-} else {
-  console.warn('WARNING: GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set — OAuth disabled');
-}
-
-passport.serializeUser((user, done) => done(null, user));
-passport.deserializeUser((user, done) => done(null, user));
-
-app.use(passport.initialize());
-// No passport.session() — we don't use sessions at all
-
-// ── JWT AUTH MIDDLEWARE ────────────────────────────────────────────────────
+// ── AUTH MIDDLEWARE ────────────────────────────────────────────────────────
+// Trusts x-user-email header (set by frontend after Google sign-in).
+// Only allows @zamp.ai accounts.
 function requireAuth(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Not authenticated' });
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch (e) {
-    res.status(401).json({ error: 'Invalid or expired token' });
+  const email = req.headers['x-user-email'] || '';
+  if (!email.endsWith('@zamp.ai')) {
+    return res.status(401).json({ error: 'Not authenticated' });
   }
+  req.userEmail = email;
+  next();
 }
-
-// ── AUTH ROUTES ────────────────────────────────────────────────────────────
-app.get('/auth/google',
-  passport.authenticate('google', { scope: ['profile', 'email'], session: false })
-);
-
-app.get('/auth/google/callback',
-  passport.authenticate('google', { failureRedirect: '/auth/failed', session: false }),
-  (req, res) => {
-    // Sign a JWT and redirect to frontend with it in the URL
-    const token = jwt.sign(req.user, JWT_SECRET, { expiresIn: '7d' });
-    const frontendUrl = process.env.FRONTEND_URL || 'https://natwest-org.zampapps.com';
-    res.redirect(`${frontendUrl}?token=${token}`);
-  }
-);
-
-app.get('/auth/failed', (req, res) => {
-  res.status(403).json({ error: 'Only @zamp.ai accounts are allowed.' });
-});
-
-app.get('/auth/me', (req, res) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  if (!token) return res.json({ authenticated: false });
-  try {
-    const user = jwt.verify(token, JWT_SECRET);
-    res.json({ authenticated: true, user });
-  } catch (e) {
-    res.json({ authenticated: false });
-  }
-});
-
-app.post('/auth/logout', (req, res) => {
-  // JWT is stateless — logout is handled client-side by deleting the token
-  res.json({ success: true });
-});
 
 // ── DATABASE ───────────────────────────────────────────────────────────────
 const { CLIENTS } = require('./clients');
@@ -221,7 +156,7 @@ app.post('/api/interactions/:contactEmail', requireAuth, async (req, res) => {
       `INSERT INTO org_chart_interactions (contact_email, client_id, type, notes, interaction_date, logged_by)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [contactEmail, clientId, type || 'note', notes || '', date || new Date().toISOString(), req.user.email]
+      [contactEmail, clientId, type || 'note', notes || '', date || new Date().toISOString(), req.userEmail]
     );
     res.json({ success: true, entry: result.rows[0] });
   } catch (err) {
@@ -231,20 +166,8 @@ app.post('/api/interactions/:contactEmail', requireAuth, async (req, res) => {
 });
 
 // ── HEALTH CHECK ───────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'zamp-org-chart-backend' });
-});
-
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    env: process.env.NODE_ENV || 'development',
-    oauth: !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET)
-  });
-});
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'zamp-org-chart-backend' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', env: process.env.NODE_ENV || 'development' }));
 
 // ── START ──────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`NatWest Org Backend running on port ${PORT}`);
-  console.log(`Google OAuth client: ${process.env.GOOGLE_CLIENT_ID?.slice(0, 30)}...`);
-});
+app.listen(PORT, () => console.log(`NatWest Org Backend running on port ${PORT}`));
