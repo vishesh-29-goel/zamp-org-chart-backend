@@ -1,14 +1,15 @@
 require('dotenv').config();
 const express = require('express');
-const session = require('express-session');
 const passport = require('passport');
 const { Strategy: GoogleStrategy } = require('passport-google-oauth20');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const JWT_SECRET = process.env.JWT_SECRET || process.env.SESSION_SECRET || 'natwest-org-secret-key';
 
-// ── CORS ──────────────────────────────────────────────────────────────────────
+// ── CORS ───────────────────────────────────────────────────────────────────
 const allowedOrigins = [
   'https://natwest-org.zampapps.com',
   'http://localhost:3000',
@@ -25,21 +26,8 @@ app.use(cors({
 
 app.use(express.json());
 
-// ── SESSION ───────────────────────────────────────────────────────────────────
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'natwest-org-secret-key',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    secure: process.env.NODE_ENV === 'production',
-    maxAge: 24 * 60 * 60 * 1000  // 24 hours
-  }
-}));
-
-// ── PASSPORT GOOGLE OAUTH ─────────────────────────────────────────────────────
-// Guard: only register the strategy if credentials are present.
-// Without this guard, Passport throws at module load when env vars are missing,
-// which prevents app.listen() from ever being called → Railway "service unavailable".
+// ── PASSPORT GOOGLE OAUTH ──────────────────────────────────────────────────
+// No session needed — we use JWT instead
 if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
   passport.use(new GoogleStrategy({
     clientID: process.env.GOOGLE_CLIENT_ID,
@@ -60,26 +48,33 @@ passport.serializeUser((user, done) => done(null, user));
 passport.deserializeUser((user, done) => done(null, user));
 
 app.use(passport.initialize());
-app.use(passport.session());
+// No passport.session() — we don't use sessions at all
 
-// ── AUTH MIDDLEWARE ────────────────────────────────────────────────────────────
+// ── JWT AUTH MIDDLEWARE ────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
-  if (req.isAuthenticated()) return next();
-  res.status(401).json({ error: 'Not authenticated' });
+  const authHeader = req.headers['authorization'];
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (e) {
+    res.status(401).json({ error: 'Invalid or expired token' });
+  }
 }
 
-
-// ── AUTH ROUTES ────────────────────────────────────────────────────────────────
+// ── AUTH ROUTES ────────────────────────────────────────────────────────────
 app.get('/auth/google',
-  passport.authenticate('google', { scope: ['profile', 'email'] })
+  passport.authenticate('google', { scope: ['profile', 'email'], session: false })
 );
 
 app.get('/auth/google/callback',
-  passport.authenticate('google', { failureRedirect: '/auth/failed' }),
+  passport.authenticate('google', { failureRedirect: '/auth/failed', session: false }),
   (req, res) => {
-    // Redirect back to the frontend after successful login
+    // Sign a JWT and redirect to frontend with it in the URL
+    const token = jwt.sign(req.user, JWT_SECRET, { expiresIn: '7d' });
     const frontendUrl = process.env.FRONTEND_URL || 'https://natwest-org.zampapps.com';
-    res.redirect(frontendUrl + '?auth=success');
+    res.redirect(`${frontendUrl}?token=${token}`);
   }
 );
 
@@ -88,17 +83,23 @@ app.get('/auth/failed', (req, res) => {
 });
 
 app.get('/auth/me', (req, res) => {
-  if (!req.isAuthenticated()) return res.json({ authenticated: false });
-  res.json({ authenticated: true, user: req.user });
+  const authHeader = req.headers['authorization'];
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.json({ authenticated: false });
+  try {
+    const user = jwt.verify(token, JWT_SECRET);
+    res.json({ authenticated: true, user });
+  } catch (e) {
+    res.json({ authenticated: false });
+  }
 });
 
 app.post('/auth/logout', (req, res) => {
-  req.logout(() => res.json({ success: true }));
+  // JWT is stateless — logout is handled client-side by deleting the token
+  res.json({ success: true });
 });
 
-// ── DATABASE ───────────────────────────────────────────────────────────────────
-// All email data is read from crm_client_emails (populated daily by the CRM refresh).
-// client_id=6 is NatWest. No Composio API key needed.
+// ── DATABASE ───────────────────────────────────────────────────────────────
 const { CLIENTS } = require('./clients');
 const { Pool } = require('pg');
 
@@ -107,10 +108,7 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL?.includes('localhost') ? false : { rejectUnauthorized: false }
 });
 
-// ── EMAIL ROUTES ───────────────────────────────────────────────────────────────
-
-// Fetch emails to/from a contact by their email address
-// GET /api/emails/:contactEmail?client=natwest
+// ── EMAIL ROUTES ───────────────────────────────────────────────────────────
 app.get('/api/emails/:contactEmail', requireAuth, async (req, res) => {
   const { contactEmail } = req.params;
   const clientId = req.query.client || 'natwest';
@@ -135,8 +133,6 @@ app.get('/api/emails/:contactEmail', requireAuth, async (req, res) => {
   }
 });
 
-// Search emails by contact name (for contacts whose email address isn't known)
-// GET /api/emails/search?name=Gary+Southgate&client=natwest
 app.get('/api/emails/search', requireAuth, async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: 'name query param required' });
@@ -163,8 +159,6 @@ app.get('/api/emails/search', requireAuth, async (req, res) => {
   }
 });
 
-// Get all emails in a thread by thread_id
-// GET /api/emails/thread/:threadId?client=natwest
 app.get('/api/emails/thread/:threadId', requireAuth, async (req, res) => {
   const { threadId } = req.params;
   const clientId = req.query.client || 'natwest';
@@ -187,10 +181,7 @@ app.get('/api/emails/thread/:threadId', requireAuth, async (req, res) => {
   }
 });
 
-// ── INTERACTION LOG ROUTES ─────────────────────────────────────────────────────
-// Manually-logged touchpoints stored in DB (persists across server restarts)
-
-// Ensure table exists on startup
+// ── INTERACTION LOG ROUTES ─────────────────────────────────────────────────
 pool.query(`
   CREATE TABLE IF NOT EXISTS org_chart_interactions (
     id SERIAL PRIMARY KEY,
@@ -239,8 +230,7 @@ app.post('/api/interactions/:contactEmail', requireAuth, async (req, res) => {
   }
 });
 
-// ── HEALTH CHECK ───────────────────────────────────────────────────────────────
-// Both / and /health return 200 — Railway probes / by default
+// ── HEALTH CHECK ───────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'zamp-org-chart-backend' });
 });
@@ -253,9 +243,8 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ── START ──────────────────────────────────────────────────────────────────────
+// ── START ──────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`NatWest Org Backend running on port ${PORT}`);
   console.log(`Google OAuth client: ${process.env.GOOGLE_CLIENT_ID?.slice(0, 30)}...`);
 });
-
