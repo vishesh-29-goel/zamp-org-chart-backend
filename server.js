@@ -38,17 +38,24 @@ app.use(session({
 }));
 
 // ── PASSPORT GOOGLE OAUTH ─────────────────────────────────────────────────────
-passport.use(new GoogleStrategy({
-  clientID: process.env.GOOGLE_CLIENT_ID,
-  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-  callbackURL: process.env.CALLBACK_URL || 'http://localhost:3001/auth/google/callback'
-}, (accessToken, refreshToken, profile, done) => {
-  const email = profile.emails?.[0]?.value || '';
-  if (!email.endsWith('@zamp.ai')) {
-    return done(null, false, { message: 'Only @zamp.ai accounts are allowed.' });
-  }
-  return done(null, { email, name: profile.displayName, picture: profile.photos?.[0]?.value });
-}));
+// Guard: only register the strategy if credentials are present.
+// Without this guard, Passport throws at module load when env vars are missing,
+// which prevents app.listen() from ever being called → Railway "service unavailable".
+if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+  passport.use(new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    callbackURL: process.env.CALLBACK_URL || 'http://localhost:3001/auth/google/callback'
+  }, (accessToken, refreshToken, profile, done) => {
+    const email = profile.emails?.[0]?.value || '';
+    if (!email.endsWith('@zamp.ai')) {
+      return done(null, false, { message: 'Only @zamp.ai accounts are allowed.' });
+    }
+    return done(null, { email, name: profile.displayName, picture: profile.photos?.[0]?.value });
+  }));
+} else {
+  console.warn('WARNING: GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set — OAuth disabled');
+}
 
 passport.serializeUser((user, done) => done(null, user));
 passport.deserializeUser((user, done) => done(null, user));
@@ -240,8 +247,17 @@ app.post('/api/interactions/:contactEmail', requireAuth, (req, res) => {
 });
 
 // ── HEALTH CHECK ───────────────────────────────────────────────────────────────
+// Both / and /health return 200 — Railway probes / by default
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'zamp-org-chart-backend' });
+});
+
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', env: process.env.NODE_ENV || 'development' });
+  res.json({
+    status: 'ok',
+    env: process.env.NODE_ENV || 'development',
+    oauth: !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET)
+  });
 });
 
 // ── START ──────────────────────────────────────────────────────────────────────
