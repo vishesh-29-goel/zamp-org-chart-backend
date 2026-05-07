@@ -1,17 +1,18 @@
 // ─── CLIENT CONFIG ────────────────────────────────────────────────────────────
 // Add a new entry here when onboarding a new client org chart.
-// composioConnectionId: the customer@ mailbox Composio connection for that client.
+// dbId: the client_id in the crm_client_emails table (check crm_clients to find it).
 
 const CLIENTS = {
   natwest: {
     name: 'NatWest',
-    composioConnectionId: '7b7c19e1-c755-409b-9c11-e0437a4ba260',
+    dbId: 6,  // crm_clients.id = 6 (NatWest)
     frontendUrl: 'https://natwest-org.zampapps.com'
   }
-  // Future clients:
+  // Future clients — find their dbId with:
+  // SELECT id, name FROM crm_clients WHERE name ILIKE '%instacart%';
   // instacart: {
   //   name: 'Instacart',
-  //   composioConnectionId: '<instacart customer@ connection id>',
+  //   dbId: <id from crm_clients>,
   //   frontendUrl: 'https://instacart-org.zampapps.com'
   // }
 };

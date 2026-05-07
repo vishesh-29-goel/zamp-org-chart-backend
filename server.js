@@ -97,153 +97,147 @@ app.post('/auth/logout', (req, res) => {
   req.logout(() => res.json({ success: true }));
 });
 
-// ── EMAIL ROUTES ───────────────────────────────────────────────────────────────
+// ── DATABASE ───────────────────────────────────────────────────────────────────
+// All email data is read from crm_client_emails (populated daily by the CRM refresh).
+// client_id=6 is NatWest. No Composio API key needed.
 const { CLIENTS } = require('./clients');
-const COMPOSIO_API_KEY = process.env.COMPOSIO_API_KEY;
+const { Pool } = require('pg');
 
-function getConnectionId(clientId) {
-  const client = CLIENTS[clientId];
-  if (!client) return null;
-  return client.composioConnectionId;
-}
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('localhost') ? false : { rejectUnauthorized: false }
+});
 
-// Fetch emails to/from a contact — requires ?client=natwest (etc.)
+// ── EMAIL ROUTES ───────────────────────────────────────────────────────────────
+
+// Fetch emails to/from a contact by their email address
+// GET /api/emails/:contactEmail?client=natwest
 app.get('/api/emails/:contactEmail', requireAuth, async (req, res) => {
   const { contactEmail } = req.params;
   const clientId = req.query.client || 'natwest';
-  const connectionId = getConnectionId(clientId);
-
-  if (!connectionId) {
-    return res.status(400).json({ error: `Unknown client: ${clientId}` });
-  }
-
-  if (!COMPOSIO_API_KEY) {
-    return res.status(500).json({ error: 'COMPOSIO_API_KEY not configured' });
-  }
+  const clientDbId = CLIENTS[clientId]?.dbId;
+  if (!clientDbId) return res.status(400).json({ error: `Unknown client: ${clientId}` });
 
   try {
-    // Search Gmail for emails to/from the contact
-    const query = `from:${contactEmail} OR to:${contactEmail}`;
-
-    const response = await fetch('https://backend.composio.dev/api/v1/actions/GMAIL_LIST_THREADS/execute', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': COMPOSIO_API_KEY
-      },
-      body: JSON.stringify({
-        connectedAccountId: connectionId,
-        input: {
-          query: query,
-          max_results: 20,
-          include_spam_trash: false
-        }
-      })
-    });
-
-    if (!response.ok) {
-      const err = await response.text();
-      console.error('Composio error:', err);
-      return res.status(502).json({ error: 'Failed to fetch emails from Gmail' });
-    }
-
-    const data = await response.json();
-    res.json({ emails: data?.data?.threads || data?.data || [], query });
-
+    const result = await pool.query(
+      `SELECT id, gmail_message_id, thread_id, from_address, to_address,
+              subject, body_snippet, full_body, direction, received_at, created_at
+       FROM crm_client_emails
+       WHERE client_id = $1
+         AND (from_address ILIKE $2 OR to_address ILIKE $2)
+       ORDER BY received_at DESC NULLS LAST, created_at DESC
+       LIMIT 50`,
+      [clientDbId, `%${contactEmail}%`]
+    );
+    res.json({ emails: result.rows, total: result.rowCount });
   } catch (err) {
-    console.error('Email fetch error:', err);
-    res.status(500).json({ error: 'Internal error fetching emails' });
+    console.error('DB email fetch error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch emails' });
   }
 });
 
-// Search emails by person name (for contacts without email address)
+// Search emails by contact name (for contacts whose email address isn't known)
+// GET /api/emails/search?name=Gary+Southgate&client=natwest
 app.get('/api/emails/search', requireAuth, async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: 'name query param required' });
   const clientId = req.query.client || 'natwest';
-  const connectionId = getConnectionId(clientId);
-  if (!connectionId) return res.status(400).json({ error: `Unknown client: ${clientId}` });
+  const clientDbId = CLIENTS[clientId]?.dbId;
+  if (!clientDbId) return res.status(400).json({ error: `Unknown client: ${clientId}` });
 
-  if (!COMPOSIO_API_KEY) {
-    return res.status(500).json({ error: 'COMPOSIO_API_KEY not configured' });
-  }
-
-  const clientName = CLIENTS[clientId]?.name || clientId;
   try {
-    const query = `"${name}" ${clientName}`;
-    const response = await fetch('https://backend.composio.dev/api/v1/actions/GMAIL_LIST_THREADS/execute', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': COMPOSIO_API_KEY },
-      body: JSON.stringify({
-        connectedAccountId: connectionId,
-        input: { query, max_results: 15, include_spam_trash: false }
-      })
-    });
-    const data = await response.json();
-    res.json({ emails: data?.data?.threads || data?.data || [], query });
+    const result = await pool.query(
+      `SELECT id, gmail_message_id, thread_id, from_address, to_address,
+              subject, body_snippet, full_body, direction, received_at, created_at
+       FROM crm_client_emails
+       WHERE client_id = $1
+         AND (from_address ILIKE $2 OR to_address ILIKE $2
+              OR subject ILIKE $2 OR full_body ILIKE $2)
+       ORDER BY received_at DESC NULLS LAST, created_at DESC
+       LIMIT 30`,
+      [clientDbId, `%${name}%`]
+    );
+    res.json({ emails: result.rows, total: result.rowCount });
   } catch (err) {
-    console.error('Name search error:', err);
-    res.status(500).json({ error: 'Internal error' });
+    console.error('DB email search error:', err.message);
+    res.status(500).json({ error: 'Failed to search emails' });
   }
 });
 
-// Get a specific email thread
+// Get all emails in a thread by thread_id
+// GET /api/emails/thread/:threadId?client=natwest
 app.get('/api/emails/thread/:threadId', requireAuth, async (req, res) => {
   const { threadId } = req.params;
   const clientId = req.query.client || 'natwest';
-  const connectionId = getConnectionId(clientId);
-  if (!connectionId) return res.status(400).json({ error: `Unknown client: ${clientId}` });
-
-  if (!COMPOSIO_API_KEY) {
-    return res.status(500).json({ error: 'COMPOSIO_API_KEY not configured' });
-  }
+  const clientDbId = CLIENTS[clientId]?.dbId;
+  if (!clientDbId) return res.status(400).json({ error: `Unknown client: ${clientId}` });
 
   try {
-    const response = await fetch('https://backend.composio.dev/api/v1/actions/GMAIL_GET_THREAD/execute', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': COMPOSIO_API_KEY
-      },
-      body: JSON.stringify({
-        connectedAccountId: connectionId,
-        input: { thread_id: threadId }
-      })
-    });
-
-    const data = await response.json();
-    res.json(data?.data || {});
+    const result = await pool.query(
+      `SELECT id, gmail_message_id, thread_id, from_address, to_address,
+              subject, body_snippet, full_body, direction, received_at, created_at
+       FROM crm_client_emails
+       WHERE client_id = $1 AND thread_id = $2
+       ORDER BY received_at ASC NULLS LAST, created_at ASC`,
+      [clientDbId, threadId]
+    );
+    res.json({ messages: result.rows, total: result.rowCount });
   } catch (err) {
+    console.error('DB thread fetch error:', err.message);
     res.status(500).json({ error: 'Failed to fetch thread' });
   }
 });
 
+// ── INTERACTION LOG ROUTES ─────────────────────────────────────────────────────
+// Manually-logged touchpoints stored in DB (persists across server restarts)
 
-// ── INTERACTION LOG ROUTES (in-memory for now, upgrade to DB later) ────────────
-// Store manually-logged interactions in memory (persists per server session)
-const interactionLog = {}; // { contactEmail: [{ date, type, notes, loggedBy }] }
+// Ensure table exists on startup
+pool.query(`
+  CREATE TABLE IF NOT EXISTS org_chart_interactions (
+    id SERIAL PRIMARY KEY,
+    contact_email VARCHAR(255) NOT NULL,
+    client_id VARCHAR(50) NOT NULL DEFAULT 'natwest',
+    type VARCHAR(50) NOT NULL DEFAULT 'note',
+    notes TEXT,
+    interaction_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    logged_by VARCHAR(255),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(err => console.error('Failed to create interactions table:', err.message));
 
-app.get('/api/interactions/:contactEmail', requireAuth, (req, res) => {
-  const logs = interactionLog[req.params.contactEmail] || [];
-  res.json({ interactions: logs });
+app.get('/api/interactions/:contactEmail', requireAuth, async (req, res) => {
+  const clientId = req.query.client || 'natwest';
+  try {
+    const result = await pool.query(
+      `SELECT id, contact_email, type, notes, interaction_date, logged_by, created_at
+       FROM org_chart_interactions
+       WHERE contact_email ILIKE $1 AND client_id = $2
+       ORDER BY interaction_date DESC`,
+      [req.params.contactEmail, clientId]
+    );
+    res.json({ interactions: result.rows });
+  } catch (err) {
+    console.error('DB interactions fetch error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch interactions' });
+  }
 });
 
-app.post('/api/interactions/:contactEmail', requireAuth, (req, res) => {
+app.post('/api/interactions/:contactEmail', requireAuth, async (req, res) => {
   const { contactEmail } = req.params;
   const { type, notes, date } = req.body;
-
-  if (!interactionLog[contactEmail]) interactionLog[contactEmail] = [];
-
-  const entry = {
-    id: Date.now(),
-    date: date || new Date().toISOString(),
-    type: type || 'note',
-    notes: notes || '',
-    loggedBy: req.user.email
-  };
-
-  interactionLog[contactEmail].unshift(entry);
-  res.json({ success: true, entry });
+  const clientId = req.query.client || 'natwest';
+  try {
+    const result = await pool.query(
+      `INSERT INTO org_chart_interactions (contact_email, client_id, type, notes, interaction_date, logged_by)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [contactEmail, clientId, type || 'note', notes || '', date || new Date().toISOString(), req.user.email]
+    );
+    res.json({ success: true, entry: result.rows[0] });
+  } catch (err) {
+    console.error('DB interactions insert error:', err.message);
+    res.status(500).json({ error: 'Failed to save interaction' });
+  }
 });
 
 // ── HEALTH CHECK ───────────────────────────────────────────────────────────────
